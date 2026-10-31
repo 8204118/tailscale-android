@@ -39,24 +39,77 @@ jobs:
       - name: Run Go tests
         run: make go-test
 
-      - name: Build APKs
-        run: make tailscale-debug.apk
+      - name: Build release APK
+        run: |
+          make gradle-dependencies
+          (cd android && ./gradlew assembleRelease --console=plain)
+          ls -la android/build/outputs/apk/release/
 
-      - name: Upload debug APK artifact
+      - name: Strip to arm64-v8a and repack
+        run: |
+          set -e
+          APK=$(find android/build/outputs/apk/release -name "*.apk" | head -1)
+          echo "Source APK: $APK"
+          python3 - "$APK" <<'EOF'
+          import sys, zipfile
+          src = sys.argv[1]
+          dst = "repacked.apk"
+          with zipfile.ZipFile(src, "r") as zin, zipfile.ZipFile(dst, "w") as zout:
+              for item in zin.infolist():
+                  name = item.filename
+                  if name.startswith("lib/"):
+                      arch = name.split("/")[1]
+                      if arch != "arm64-v8a":
+                          continue
+                  data = zin.read(name)
+                  zi = zipfile.ZipInfo(name, item.date_time)
+                  zi.compress_type = zipfile.ZIP_STORED if name.endswith(".so") else (item.compress_type or zipfile.ZIP_DEFLATED)
+                  zi.external_attr = item.external_attr
+                  zout.writestr(zi, data)
+          print("repacked:", dst)
+          EOF
+          BT=$(ls -d "$ANDROID_HOME"/build-tools/* 2>/dev/null | tail -1)
+          [ -z "$BT" ] && BT=$(dirname "$(find / -maxdepth 6 -name zipalign 2>/dev/null | head -1)")
+          echo "build-tools: $BT"
+          "$BT/zipalign" -f 4 repacked.apk aligned.apk
+
+      - name: Restore debug signing keystore
+        uses: actions/cache@v4
+        with:
+          path: ~/.android/debug.keystore
+          key: android-debug-keystore-v1
+
+      - name: Sign release APK
+        run: |
+          set -e
+          mkdir -p ~/.android
+          if [ ! -f ~/.android/debug.keystore ]; then
+            keytool -genkeypair -v -keystore ~/.android/debug.keystore -storepass android \
+              -alias androiddebugkey -keypass android -keyalg RSA -keysize 2048 \
+              -validity 10000 -dname "CN=Android Debug,O=Android,C=US"
+          fi
+          BT=$(ls -d "$ANDROID_HOME"/build-tools/* 2>/dev/null | tail -1)
+          [ -z "$BT" ] && BT=$(dirname "$(find / -maxdepth 6 -name apksigner 2>/dev/null | head -1)")
+          "$BT/apksigner" sign --ks ~/.android/debug.keystore --ks-pass pass:android \
+            --ks-key-alias androiddebugkey --key-pass pass:android \
+            --out tailscale-release-arm64.apk aligned.apk
+          ls -la tailscale-release-arm64.apk
+
+      - name: Upload release APK artifact
         uses: actions/upload-artifact@v4
         with:
-          name: tailscale-debug-apk
-          path: tailscale-debug.apk
+          name: tailscale-release-arm64-apk
+          path: tailscale-release-arm64.apk
 
       - name: Create CI release with APK
         uses: softprops/action-gh-release@v2
         if: github.event_name == 'push'
         with:
-          files: tailscale-debug.apk
+          files: tailscale-release-arm64.apk
           tag_name: ci-${{ github.run_id }}
           name: CI build ${{ github.run_id }}
           body: |
-            Auto-built debug APK with Simplified Chinese (zh-rCN) localization.
+            Auto-built release APK (arm64-v8a, R8-minified) with Simplified Chinese (zh-rCN) localization.
 
       - name: Run tests
         run: make test
